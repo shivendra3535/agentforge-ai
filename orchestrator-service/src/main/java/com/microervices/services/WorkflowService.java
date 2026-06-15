@@ -1,16 +1,13 @@
 package com.microervices.services;
 
-import com.microervices.dto.CoderRequest;
-import com.microervices.dto.DebugRequest;
+import com.microervices.dto.AgentTask;
 import com.microervices.models.AgentResult;
 import com.microervices.models.WorkflowJob;
 import com.microervices.repository.AgentResultRepository;
 import com.microervices.repository.WorkflowJobRepository;
-import org.springframework.http.*;
-import org.springframework.scheduling.annotation.Async;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-import org.springframework.http.HttpHeaders;
 
 import java.time.LocalDateTime;
 
@@ -19,92 +16,53 @@ public class WorkflowService {
 
     private final WorkflowJobRepository jobRepository;
     private final AgentResultRepository resultRepository;
-    private final RestTemplate restTemplate;
+    private final KafkaTemplate<String, AgentTask> kafkaTemplate;
 
-    private static final String PLANNER_URL =
-            "http://localhost:8082/internal/planner/run";
-
-    private static final String CODER_URL =
-            "http://localhost:8083/internal/coder/run";
-
-    private static final String DEBUGGER_URL =
-            "http://localhost:8084/internal/debugger/run";
-
-    public WorkflowService(
-            WorkflowJobRepository jobRepository,
-            AgentResultRepository resultRepository,
-            RestTemplate restTemplate) {
-
+    public WorkflowService(WorkflowJobRepository jobRepository,
+                           AgentResultRepository resultRepository,
+                           KafkaTemplate<String, AgentTask> kafkaTemplate) {
         this.jobRepository = jobRepository;
         this.resultRepository = resultRepository;
-        this.restTemplate = restTemplate;
+        this.kafkaTemplate = kafkaTemplate;
     }
 
+    // Called from WorkflowController — returns instantly (202)
     public Long createJob(String prompt) {
         WorkflowJob job = new WorkflowJob();
         job.setUserPrompt(prompt);
         job.setStatus(WorkflowJob.JobStatus.PENDING);
         jobRepository.save(job);
 
-        runWorkflow(job.getId(), prompt);
+        updateJobStatus(job.getId(), WorkflowJob.JobStatus.RUNNING);
+
+        AgentTask task = new AgentTask(job.getId(), prompt, null, "ORCHESTRATOR");
+        kafkaTemplate.send("agent-planner-topic", task);
 
         return job.getId();
     }
 
-    @Async
-    public void runWorkflow(Long jobId, String userPrompt) {
+    // Listens for ALL agent results
+    @KafkaListener(topics = "agent-result-topic", groupId = "orchestrator-group",
+            containerFactory = "agentTaskKafkaListenerContainerFactory")
+    public void handleAgentResult(AgentTask result) {
+        saveResult(result.getJobId(), result.getSourceAgent(), result.getPreviousAgentOutput());
 
-        try {
-            updateJobStatus(jobId, WorkflowJob.JobStatus.RUNNING);
+        AgentTask nextTask = new AgentTask(
+                result.getJobId(),
+                result.getUserPrompt(),
+                result.getPreviousAgentOutput(),
+                result.getSourceAgent()
+        );
 
-            var plannerBody = new java.util.HashMap<String, Object>();
-            plannerBody.put("jobId", jobId);
-            plannerBody.put("context", userPrompt);
-
-            String planResult = postToAgent(PLANNER_URL, plannerBody);
-            saveResult(jobId, "PLANNER", planResult);
-
-            CoderRequest coderRequest =
-                    new CoderRequest(jobId, userPrompt, planResult);
-
-            String codeResult = postToAgent(CODER_URL, coderRequest);
-            saveResult(jobId, "CODER", codeResult);
-
-            DebugRequest debugRequest =
-                    new DebugRequest(jobId, codeResult);
-
-            String debugResult = postToAgent(DEBUGGER_URL, debugRequest);
-            saveResult(jobId, "DEBUGGER", debugResult);
-
-            updateJobStatus(jobId, WorkflowJob.JobStatus.DONE);
-
-        } catch (Exception e) {
-            updateJobStatus(jobId, WorkflowJob.JobStatus.FAILED);
-            saveResult(jobId, "ERROR", e.getMessage());
+        switch (result.getSourceAgent()) {
+            case "PLANNER"    -> kafkaTemplate.send("agent-coder-topic",     nextTask);
+            case "CODER"      -> kafkaTemplate.send("agent-debugger-topic",  nextTask);
+            case "DEBUGGER"   -> updateJobStatus(result.getJobId(), WorkflowJob.JobStatus.DONE);
+            default ->  updateJobStatus(result.getJobId(), WorkflowJob.JobStatus.FAILED);
         }
     }
 
-    private String postToAgent(String url, Object body) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-
-        ResponseEntity<String> response =
-                restTemplate.exchange(
-                        url,
-                        HttpMethod.POST,
-                        entity,
-                        String.class
-                );
-
-        return response.getBody();
-    }
-
-    private void saveResult(
-            Long jobId,
-            String agentName,
-            String output) {
-
+    private void saveResult(Long jobId, String agentName, String output) {
         AgentResult result = new AgentResult();
         result.setJobId(jobId);
         result.setAgentName(agentName);
@@ -114,26 +72,17 @@ public class WorkflowService {
         resultRepository.save(result);
     }
 
-    private void updateJobStatus(
-            Long jobId,
-            WorkflowJob.JobStatus status) {
-
-        WorkflowJob job = jobRepository.findById(jobId)
-                .orElseThrow();
+    private void updateJobStatus(Long jobId, WorkflowJob.JobStatus status) {
+        WorkflowJob job = jobRepository.findById(jobId).orElseThrow();
         job.setStatus(status);
-
-        if (status == WorkflowJob.JobStatus.DONE
-                || status == WorkflowJob.JobStatus.FAILED) {
+        if (status == WorkflowJob.JobStatus.DONE || status == WorkflowJob.JobStatus.FAILED) {
             job.setCompletedAt(LocalDateTime.now());
         }
-
         jobRepository.save(job);
     }
 
     public WorkflowJob getJob(Long id) {
         return jobRepository.findById(id)
-                .orElseThrow(() ->
-                        new RuntimeException("Job not found")
-                );
+                .orElseThrow(() -> new RuntimeException("Job not found"));
     }
 }

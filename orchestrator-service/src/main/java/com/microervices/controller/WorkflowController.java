@@ -23,16 +23,8 @@ public class WorkflowController {
     public ResponseEntity<?> createJob(
             @RequestBody CreateJobRequest request){
 
-        Long jobId =
-                workflowService.createJob(
-                        request.getUserPrompt()
-                );
-
-        return ResponseEntity.ok(
-                Map.of(
-                        "jobId",
-                        jobId
-                )
-        );
+        Long jobId = workflowService.createJob(request.getUserPrompt());
+        return ResponseEntity.accepted()   // 202 Accepted — job is async now
+                .body(Map.of("jobId", jobId));
     }
 }
