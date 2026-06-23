@@ -493,11 +493,7 @@ Java Full Stack Developer | Spring Boot | Microservices | Kafka | AI Systems
 
 ---
 
-# License
 
-This project is licensed under the MIT License.
-
----
 
 # Final Note
 
